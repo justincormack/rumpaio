@@ -53,7 +53,7 @@ struct rumpuser_bio {
 	struct iocb iocb;
 };
 
-#define N_BIOS 16
+#define N_BIOS 32
 static pthread_mutex_t biomtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t biocv = PTHREAD_COND_INITIALIZER;
 static int bio_head, bio_tail;
