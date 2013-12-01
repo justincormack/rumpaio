@@ -50,8 +50,7 @@ struct rumpuser_bio {
 	rump_biodone_fn bio_done;
 	void *bio_donearg;
 
-	size_t res;
-	struct iocb iocb, iocbf;
+	struct iocb iocb;
 };
 
 #define N_BIOS 16
@@ -82,19 +81,12 @@ riothread(void *arg)
 			biop = (struct rumpuser_bio *) ioev[i].data;
 			iocb = (struct iocb *) ioev[i].obj;
 			sync = biop->bio_op & RUMPUSER_BIO_WRITE && biop->bio_op & RUMPUSER_BIO_SYNC;
-			/* if it is sync, ack on the sync not the write */
+			/* if it is sync, sync it now */
 			if (sync) {
-				if (iocb->aio_lio_opcode == IOCB_CMD_FDSYNC) {
-					assert(biop->res != 0); /* would mean fsync complete before write */
-					biop->bio_done(biop->bio_donearg, biop->res, error);
-					biop->bio_donearg = NULL; /* paranoia */
-				} else {
-					biop->res = (size_t) ioev[i].res; /* save res */
-				}
-			} else {
-				biop->bio_done(biop->bio_donearg, (size_t) ioev[i].res, error);
-				biop->bio_donearg = NULL; /* paranoia */
+				fdatasync(biop->bio_fd);
 			}
+			biop->bio_done(biop->bio_donearg, (size_t) ioev[i].res, error);
+			biop->bio_donearg = NULL; /* paranoia */
 		}
 		rumpkern_unsched(&dummy, NULL);
 	}
@@ -106,15 +98,12 @@ static void
 dobio(struct rumpuser_bio *biop)
 {
 	struct iocb *iocb = &biop->iocb;
-	struct iocb *iocbf = &biop->iocbf;
-	struct iocb *iocbpp[2];
-	int ret, nio;
+	struct iocb *iocbpp[1];
+	int ret;
 	const struct timespec shorttime = {0, 1000};
 
 	memset(iocb, 0, sizeof(struct iocb));
-	memset(iocbf, 0, sizeof(struct iocb));
         iocbpp[0] = iocb;
-        iocbpp[1] = iocbf;
 
 	iocb->aio_fildes = biop->bio_fd;
 	iocb->aio_buf = (uint64_t) biop->bio_data;
@@ -129,38 +118,13 @@ dobio(struct rumpuser_bio *biop)
 		iocb->aio_lio_opcode = IOCB_CMD_PWRITE;
 	}
 
-	/* if sync bit set on a write we need to push an fsync */
-	if (biop->bio_op & RUMPUSER_BIO_WRITE && biop->bio_op & RUMPUSER_BIO_SYNC) {
-		iocbf->aio_fildes = biop->bio_fd;
-		iocbf->aio_data = (uint64_t) biop;
-		iocbf->aio_lio_opcode = IOCB_CMD_FDSYNC;
-		biop->res = 0;
-		nio = 2;
-	} else {
-		nio = 1;
-	}
-
-	// gross really. Queue fills up and we have to retry
+	// May we have to retry
 	do {
-		ret = io_submit(ctx, nio, iocbpp);
+		ret = io_submit(ctx, 1, iocbpp);
 		if (ret > 0) break;
 		assert(errno == EAGAIN);
 		nanosleep(&shorttime, NULL);
 	} while (ret < 0);
-	if (ret != nio && ret == 1) {
-		do {
-			// aargh it turns out aio_fsync not actually supported...
-			nanosleep(&shorttime, NULL);
-       			iocbpp[0] = iocbf;
-			memset(iocbf, 0, sizeof(struct iocb));
-			iocbf->aio_fildes = biop->bio_fd;
-			iocbf->aio_data = (uint64_t) biop;
-			iocbf->aio_lio_opcode = IOCB_CMD_FDSYNC;
-			ret = io_submit(ctx, 1, iocbpp);
-			if (ret == 1) break;
-			assert(errno == EAGAIN);
-		} while (ret < 0);
-	}
 }
 
 static void *
