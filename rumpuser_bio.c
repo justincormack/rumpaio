@@ -54,7 +54,7 @@ struct rumpuser_bio {
 	struct iocb iocb, iocbf;
 };
 
-#define N_BIOS 32
+#define N_BIOS 16
 static pthread_mutex_t biomtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t biocv = PTHREAD_COND_INITIALIZER;
 static int bio_head, bio_tail;
@@ -108,7 +108,8 @@ dobio(struct rumpuser_bio *biop)
 	struct iocb *iocb = &biop->iocb;
 	struct iocb *iocbf = &biop->iocbf;
 	struct iocb *iocbpp[2];
-	int ret;
+	int ret, nio;
+	const struct timespec shorttime = {0, 1000};
 
 	memset(iocb, 0, sizeof(struct iocb));
 	memset(iocbf, 0, sizeof(struct iocb));
@@ -134,11 +135,31 @@ dobio(struct rumpuser_bio *biop)
 		iocbf->aio_data = (uint64_t) biop;
 		iocbf->aio_lio_opcode = IOCB_CMD_FDSYNC;
 		biop->res = 0;
-		ret = io_submit(ctx, 2, iocbpp);
-		assert(ret == 2);
+		nio = 2;
 	} else {
-		ret = io_submit(ctx, 1, iocbpp);
-		assert(ret == 1);
+		nio = 1;
+	}
+
+	// gross really. Queue fills up and we have to retry
+	do {
+		ret = io_submit(ctx, nio, iocbpp);
+		if (ret > 0) break;
+		assert(errno == EAGAIN);
+		nanosleep(&shorttime, NULL);
+	} while (ret < 0);
+	if (ret != nio && ret == 1) {
+		do {
+			// aargh it turns out aio_fsync not actually supported...
+			nanosleep(&shorttime, NULL);
+       			iocbpp[0] = iocbf;
+			memset(iocbf, 0, sizeof(struct iocb));
+			iocbf->aio_fildes = biop->bio_fd;
+			iocbf->aio_data = (uint64_t) biop;
+			iocbf->aio_lio_opcode = IOCB_CMD_FDSYNC;
+			ret = io_submit(ctx, 1, iocbpp);
+			if (ret == 1) break;
+			assert(errno == EAGAIN);
+		} while (ret < 0);
 	}
 }
 
