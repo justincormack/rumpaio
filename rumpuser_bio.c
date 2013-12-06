@@ -88,7 +88,7 @@ riothread(void *arg)
 			error = 0;
 			res = ioev[i].res;
 			if (res < 0) {
-				error = ;
+				error = -res;
 				res = -1;
 			}
 			biop->bio_done(biop->bio_donearg, (size_t) res, error);
