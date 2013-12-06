@@ -122,7 +122,7 @@ dobio(struct rumpuser_bio *biop)
 		iocb->aio_lio_opcode = IOCB_CMD_PWRITE;
 	}
 
-	// May we have to retry (unlikely)
+	// May have to retry (very unlikely)
 	do {
 		ret = io_submit(ctx, 1, iocbpp);
 		if (ret > 0) break;
@@ -166,7 +166,7 @@ rumpuser_bio(int fd, int op, void *data, size_t dlen, int64_t doff,
 	bio->bio_done = biodone;
 	bio->bio_donearg = bioarg;
 
-	dobio(bio); // this might do EAGAIN - release lock if does
+	dobio(bio); // this might do EAGAIN (unlikely) - TODO release lock if does
 	bio_head = (bio_head+1) % N_BIOS;
 
 	pthread_mutex_unlock(&biomtx);
