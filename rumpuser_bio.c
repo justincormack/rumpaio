@@ -67,7 +67,7 @@ riothread(void *arg)
 	struct rumpuser_bio *biop;
 	struct iocb *iocb;
 	int i, n, dummy, rv, sync;
-	int error = 0; // TODO how does error handling in aio work?
+	int res, error;
 
 	rumpuser__hyp.hyp_schedule();
 	rv = rumpuser__hyp.hyp_lwproc_newlwp(0);
@@ -85,7 +85,13 @@ riothread(void *arg)
 			if (sync) {
 				fdatasync(biop->bio_fd);
 			}
-			biop->bio_done(biop->bio_donearg, (size_t) ioev[i].res, error);
+			error = 0;
+			res = ioev[i].res;
+			if (res < 0) {
+				error = -res;
+				res = -1;
+			}
+			biop->bio_done(biop->bio_donearg, (size_t) res, error);
 			biop->bio_donearg = NULL; /* paranoia */
 			NOFAIL_ERRNO(pthread_mutex_lock(&biomtx));
 			bio_tail = (bio_tail+1) % N_BIOS;
