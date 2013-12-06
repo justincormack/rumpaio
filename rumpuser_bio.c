@@ -55,7 +55,7 @@ struct rumpuser_bio {
 
 #define N_BIOS 32
 static pthread_mutex_t biomtx = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t biocv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t notfull = PTHREAD_COND_INITIALIZER;
 static int bio_head, bio_tail;
 static struct rumpuser_bio bios[N_BIOS];
 static aio_context_t ctx = 0;
@@ -87,6 +87,10 @@ riothread(void *arg)
 			}
 			biop->bio_done(biop->bio_donearg, (size_t) ioev[i].res, error);
 			biop->bio_donearg = NULL; /* paranoia */
+			NOFAIL_ERRNO(pthread_mutex_lock(&biomtx));
+			bio_tail = (bio_tail+1) % N_BIOS;
+			pthread_mutex_unlock(&biomtx);
+			pthread_cond_signal(&notfull);
 		}
 		rumpkern_unsched(&dummy, NULL);
 	}
@@ -118,7 +122,7 @@ dobio(struct rumpuser_bio *biop)
 		iocb->aio_lio_opcode = IOCB_CMD_PWRITE;
 	}
 
-	// May we have to retry
+	// May we have to retry (unlikely)
 	do {
 		ret = io_submit(ctx, 1, iocbpp);
 		if (ret > 0) break;
@@ -127,42 +131,12 @@ dobio(struct rumpuser_bio *biop)
 	} while (ret < 0);
 }
 
-static void *
-biothread(void *arg)
-{
-	struct rumpuser_bio *biop;
-	int rv;
-
-	rumpuser__hyp.hyp_schedule();
-	rv = rumpuser__hyp.hyp_lwproc_newlwp(0);
-	assert(rv == 0);
-	rumpuser__hyp.hyp_unschedule();
-	NOFAIL_ERRNO(pthread_mutex_lock(&biomtx));
-	for (;;) {
-		while (bio_head == bio_tail)
-			NOFAIL_ERRNO(pthread_cond_wait(&biocv, &biomtx));
-
-		biop = &bios[bio_tail];
-		pthread_mutex_unlock(&biomtx);
-
-		dobio(biop);
-
-		NOFAIL_ERRNO(pthread_mutex_lock(&biomtx));
-		bio_tail = (bio_tail+1) % N_BIOS;
-		pthread_cond_signal(&biocv);
-	}
-
-	/* unreachable */
-	abort();
-}
-
 void
 rumpuser_bio(int fd, int op, void *data, size_t dlen, int64_t doff,
 	rump_biodone_fn biodone, void *bioarg)
 {
-	struct rumpuser_bio bio;
+	struct rumpuser_bio *bio;
 	static int inited = 0;
-	static int usethread = 1;
 	int nlocks;
 
 	rumpkern_unsched(&nlocks, NULL);
@@ -170,49 +144,32 @@ rumpuser_bio(int fd, int op, void *data, size_t dlen, int64_t doff,
 	if (!inited) {
 		pthread_mutex_lock(&biomtx);
 		if (!inited) {
-			char buf[16];
-			pthread_t pt, rt;
+			pthread_t rt;
 			io_setup(N_BIOS, &ctx);
-
-			/*
-			 * duplicates policy of rump kernel.  maybe a bit
-			 * questionable, but since the setting is not
-			 * used in normal circumstances, let's not care
-			 */
-			if (getenv_r("RUMP_THREADS", buf, sizeof(buf)) == 0)
-				usethread = *buf != '0';
-
-			if (usethread) {
-				pthread_create(&pt, NULL, biothread, NULL);
-				pthread_create(&rt, NULL, riothread, NULL);
-			}
+			pthread_create(&rt, NULL, riothread, NULL);
 			inited = 1;
 		}
 		pthread_mutex_unlock(&biomtx);
 		assert(inited);
 	}
 
-	bio.bio_fd = fd;
-	bio.bio_op = op;
-	bio.bio_data = data;
-	bio.bio_dlen = dlen;
-	bio.bio_off = (off_t)doff;
-	bio.bio_done = biodone;
-	bio.bio_donearg = bioarg;
+	pthread_mutex_lock(&biomtx);
+	while ((bio_head+1) % N_BIOS == bio_tail)
+		pthread_cond_wait(&notfull, &biomtx);
 
-	if (!usethread) {
-		dobio(&bio);
-	} else {
-		pthread_mutex_lock(&biomtx);
-		while ((bio_head+1) % N_BIOS == bio_tail)
-			pthread_cond_wait(&biocv, &biomtx);
+	bio = &bios[bio_head];
+	bio->bio_fd = fd;
+	bio->bio_op = op;
+	bio->bio_data = data;
+	bio->bio_dlen = dlen;
+	bio->bio_off = (off_t)doff;
+	bio->bio_done = biodone;
+	bio->bio_donearg = bioarg;
 
-		bios[bio_head] = bio;
-		bio_head = (bio_head+1) % N_BIOS;
+	dobio(bio); // this might do EAGAIN - release lock if does
+	bio_head = (bio_head+1) % N_BIOS;
 
-		pthread_cond_signal(&biocv);
-		pthread_mutex_unlock(&biomtx);
-	}
+	pthread_mutex_unlock(&biomtx);
 
 	rumpkern_sched(nlocks, NULL);
 }
